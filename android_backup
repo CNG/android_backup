@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+
+# Backup a rooted Android phone with ssh and rsync
+
+NAME="android_backup"
+AUTHOR="Charlie Gorichanaz <charlie@gorichanaz.com>"
+VERSION="1.0"
+SUMMARY="Synchronize an Android phone to a directory."
+DESCRIPTION="The $NAME utility uses rsync and ssh to synchronize an Android
+device to a directory on a backup machine. The first version of this script
+makes a number of restricting assumptions that might be removed in later
+versions:
+
+    * The Android device is rooted and a full backup is desired. Later versions
+      may allow for syncing only the user partition and thus allow lifting the 
+      root requirement.
+    * The backup machine is the machine running this script. Since rsync is
+      triggered from the Android device, there is potential the backup machine
+      could in fact be a third machine despite rsync not supporting two remote
+      hosts. $NAME does not currently support this, though.
+    * The Android device must allow root escalation to the user logging in via
+      ssh. One way this can be achieved is using the SuperSU app on a rooted
+      device to grant root automatically to another app, SSHelper, which can
+      provide a suitable ssh and rsync for use with $NAME.
+    * The backup machine must accept SSH connections on the specified port as 
+      root using key specified with --mobile-key.
+"
+
+#######################################
+# Print help.
+# Globals:
+#   NAME         (string)
+#   SUMMARY      (string)
+#   DESCRIPTION  (string)
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+print_help() {
+  # get formatting escapes (http://stackoverflow.com/a/2924755/172602)
+  local b=$(tput bold)
+  local u=$(tput smul)
+  local d=$(tput sgr0)
+  local NAME="${b}$NAME${d}"
+  # Command syntax text to $synopsis for single line output
+  synopsis="$NAME
+${b}[OPTIONS]${d}
+${b}--mobile-host${d}=${u}hostname_or_ip${d}
+${b}--mobile-key${d}=${u}file${d}
+${b}--backup-host${d}=${u}hostname_or_ip${d}
+${b}--backup-dir${d}=${u}target_directory${d}"
+  synopsis=${synopsis//$'\n'/ }
+  help_text="${b}NAME${d}
+       $NAME -- $SUMMARY
+
+${b}SYNOPSIS${d}
+       $synopsis
+
+${b}DESCRIPTION${d}
+       $DESCRIPTION
+       Required arguments:
+
+       --mobile-host=HOST   Hostname or IP address of the Android device. 
+                            Hostnames are currently converted to IP addresses.
+       --mobile-key=FILE    Path to SSH key on Android device. The corresponding
+                            public key must exist in the backup machine
+                            authorized_hosts file.
+       --backup-host=HOST   Hostname or IP address of the backup machine.
+                            Hostnames will be converted to IP addresses for 
+                            reliable connection from Android device.
+       --backup-dir=FOLDER  Path to backup directory. Relative paths will be 
+                            prefixed with the current working directory.
+
+       Options:
+
+       --mobile-port=PORT   Port to connect to on the Android device. This can 
+                            be specified on a per-host basis in configuration 
+                            file on the backup host. Default 22.
+       --backup-port=PORT   Port to connect to on the backup host. This can be 
+                            specified on a per-host basis in the configuration 
+                            file. Default 22.
+       -n, --dry-run        Cause rsync to show what would have been transferred.
+       -v, --verbose        Cause $NAME to be verbose, outputting more 
+                            informational messages.
+       -V, --version        Print version number.
+       -h, --help           Show this help.
+${b}AUTHOR${d}
+       $NAME was created by $AUTHOR to get some more shell scripting experience
+by expanding one of his cronjobs into a utility potentially useful to others.
+"
+  echo "$help_text"
+  return 0
+}
+
+#######################################
+# Check if input matches IPv4 address format. Adapted from:
+# http://stackoverflow.com/a/13778973/172602
+# Globals:
+#   None
+# Arguments:
+#   ip  (string) Text to match against IPv4 address format
+# Returns:
+#   None
+#######################################
+ip4_valid() {
+  #local ip=${1:-1.2.3.4} # Use default if $ip empty. Why?!
+  local ip=$1
+  IFS=.; local -a a=($ip) # split on . into array
+  # Start with a regex format test
+  [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  # Test values of quads
+  for quad in {0..3}; do
+    ((${a[$quad]} > 255 )) && return 1
+  done
+  return 0
+}
+
+#######################################
+# Check if port is in expected range.
+# Globals:
+#   None
+# Arguments:
+#   param    (string) command line parameter name, to use in messages
+#   port     (int)    corresponding variable value
+#   verbose  (bool)   increase messages
+# Returns:
+#   None
+#######################################
+validate_port() {
+  local param=$1
+  local port=$2
+  local verbose=$3
+  local minport=0
+  local maxport=65535
+  if [[ "$port" =~ ^[0-9]+$ ]] && ((port >= minport)) && ((port <= maxport)); then
+    $verbose && echo "$param: Port $port is valid."
+    return 0
+  else
+    echo "$param: Port $port is not in range $minport-$maxport." >&2
+    return 1
+  fi
+}
+
+#######################################
+# Convert hostname to IP address if necessary.
+# Globals:
+#   $_host_var  (string) variable value corresponding to _host_var
+# Arguments:
+#   param       (string) command line parameter name, to use in messages
+#   _host_var   (string) corresponding variable name
+#   verbose     (bool)   increase messages
+# Returns:
+#   None
+#######################################
+normalize_host() {
+  local param=$1
+  local _host_var=$2
+  eval local host='$'"$2"
+  local verbose=$3
+  if ip4_valid "$host"; then
+    $verbose && echo "$param: $host is an IP."
+  else
+    $verbose && echo "$param: $host is not an IP."
+    local ip
+    local n=0
+    until (( n > 5 )); do
+      $verbose && echo "$param: Looking up IP for hostname $host."
+      ip="$(host "$host" | awk '{print $NF}')"
+      if ip4_valid "$ip"; then
+        $verbose && echo "$param: Converted hostname $host to IP $ip."
+        # assign IP address in place of hostname
+        eval $_host_var="'$ip'"
+        break
+      fi
+      $verbose && echo "$param: Failed to look up IP address of hostname $host. Got $ip. Retrying."
+      n=$((n+1))
+      sleep 2
+    done
+    if (( n == 6 )); then
+      echo "$param: Cannot resolve hostname \"$host\"." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+#######################################
+# Detect whether enhanced getopt is installed.
+# Globals:
+#   OSTYPE  (string) Set by Bash
+#   NAME    (string) Program name
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+correct_getopt_installed() {
+  getopt -T > /dev/null
+  if [[ $? -ne 4 ]]; then
+    echo "The $NAME utility requires the enhanced version of getopt."
+    if [[ $OSTYPE == darwin* ]]; then
+      if hash brew 2>/dev/null; then
+        echo 'The Homebrew package manager is already installed.'
+      else
+        echo 'getopt can be installed with the Homebrew package manager (https://brew.sh/). To install Homebrew, run:'
+        echo '/usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"'
+      fi
+      echo 'To install getopt, run the following and note the instructions for PATH modification:'
+      echo '    brew install gnu-getopt'
+    fi
+    return 1
+  fi
+  return 0
+}
+
+#######################################
+# Get options with getopt and validate. Exits if help or version called.
+# Globals:
+#   MOBILE_HOST   (string)
+#   MOBILE_PORT   (int)
+#   MOBILE_KEY    (string)
+#   BACKUP_HOST   (string)
+#   BACKUP_PORT   (int)
+#   BACKUP_DIR    (string)
+#   DRY_RUN       (string)
+#   VERBOSE       (bool)
+# Arguments:
+#   $@
+# Returns:
+#   None
+#######################################
+get_options() {
+  # Option handling code based on http://stackoverflow.com/a/7948533/172602
+  local temp
+  temp=`getopt -o vnh --long help,verbose,dry-run,mobile-host:,mobile-port:,mobile-key:,backup-host:,backup-port:,backup-dir: -n "'$NAME'" -- "$@"`
+  if [[ $? != 0 ]] ; then
+    print_help >&2
+    return 1
+  fi
+  eval set -- "$temp"
+  while true; do
+    case "$1" in
+      -V | --version ) echo "$VERSION"; exit 0 ;;
+      -h | --help    ) print_help; exit 0 ;;
+      -v | --verbose ) VERBOSE=true; shift ;;
+      -n | --dry-run ) DRY_RUN=" -n "; shift ;;
+      --mobile-host  ) MOBILE_HOST=$2; shift 2 ;;
+      --mobile-port  ) MOBILE_PORT=$2; shift 2 ;;
+      --mobile-key   ) MOBILE_KEY="-i \"$2\""; shift 2 ;;
+      --backup-host  ) BACKUP_HOST=$2; shift 2 ;;
+      --backup-port  ) BACKUP_PORT=$2; shift 2 ;;
+      --backup-dir   ) BACKUP_DIR=$2; shift 2 ;;
+      -- ) shift; break ;;
+      * ) break ;;
+    esac
+  done
+
+  # Determine whether we have all the arguments or need to exit
+  exit_flag=0
+  if ! normalize_host '--mobile-host' "MOBILE_HOST" $VERBOSE; then exit_flag=1; fi
+  if ! validate_port  '--mobile-port' $MOBILE_PORT $VERBOSE; then exit_flag=1; fi
+  if ! normalize_host '--backup-host' "BACKUP_HOST" $VERBOSE; then exit_flag=1; fi
+  if ! validate_port  '--backup-port' $BACKUP_PORT $VERBOSE; then exit_flag=1; fi
+  if [[ -z $MOBILE_KEY ]]; then
+    echo "--mobile-key required." >&2
+    exit_flag=1
+  fi
+  if [[ -z $BACKUP_DIR ]]; then
+    echo "--backup-dir required." >&2
+    exit_flag=1
+  elif [[ $BACKUP_DIR != /* ]]; then
+    # Make relative absolute
+    BACKUP_DIR="$(pwd)/$BACKUP_DIR"
+  fi
+
+  # Ensure final options stay constant. Separate lines for consistency.
+  readonly \
+    MOBILE_HOST \
+    MOBILE_PORT \
+    MOBILE_KEY \
+    BACKUP_HOST \
+    BACKUP_PORT \
+    BACKUP_DIR \
+    DRY_RUN \
+    VERBOSE \
+  ;
+
+  return $exit_flag
+}
+
+#######################################
+# Globals:
+#   NAME  (string)
+# Arguments:
+#   $@
+# Returns:
+#   None
+#######################################
+main(){
+  local MOBILE_HOST=
+  local MOBILE_PORT=22
+  local MOBILE_KEY=
+  local BACKUP_HOST=
+  local BACKUP_PORT=22
+  local BACKUP_DIR=
+  local DRY_RUN=''
+  local VERBOSE=false
+
+  correct_getopt_installed || exit 1
+  get_options "$@" || exit 1
+
+  $VERBOSE && echo "$NAME running with config:
+    --mobile-host='$MOBILE_HOST'
+    --mobile-port=$MOBILE_PORT
+    --mobile-key='$MOBILE_KEY'
+    --backup-host='$BACKUP_HOST'
+    --backup-port=$BACKUP_PORT
+    --backup-dir='$BACKUP_DIR'" >&2
+
+  # Test SSH connection
+  if [[ $(ssh -q -p$MOBILE_PORT "$MOBILE_HOST" echo ok 2>&1) != ok ]]; then
+    echo "Phone SSH not available. Try: ssh -p$MOBILE_PORT \"$MOBILE_HOST\" echo ok" >&2
+    exit 1
+  fi
+
+  # Create sync script, copy to Android and delete original
+  temp_file=~/"$NAME-command.sh"
+  echo '
+    echo "Currently executing script:\n\n$(cat "$(basename "$0")")\n\n"
+    rsync '"$DRY_RUN"' -avzH -P --delete --delete-excluded --force --numeric-ids \
+      -e "ssh -p'"$BACKUP_PORT $MOBILE_KEY"'" \
+      --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/mnt/*","/media/*","/lost+found","/storage","/config"} \
+      / root@'"$BACKUP_HOST:$BACKUP_DIR"'
+    echo "Rsync done. Deleting this script. ($0)"
+    rm -f "$(basename "$0")"
+    ' > "$temp_file"
+  rsync -a -e "ssh -q -p$MOBILE_PORT" "$temp_file" "$MOBILE_HOST":~
+  if [[ $? != 0 ]] ; then
+    echo "$NAME was unable to copy sync script to Android device."
+    exit 1
+  fi
+  rm -f "$temp_file"
+
+  # Execute sync script on Android via SSH command
+  # Currently this does not wait for or pass back output from commands run on Android, 
+  # but logs can be obtained through SuperSU app or by examing $NAME.log
+  ssh -q -p$MOBILE_PORT "$MOBILE_HOST" "su -c 'sh $(basename "$temp_file")' </dev/null >$NAME.log 2>&1 &"
+  if [[ $? != 0 ]] ; then
+    echo "$NAME was unable to execute sync script on Android device."
+    exit 1
+  fi
+
+  echo "$NAME sync script now running on Android device."
+}
+
+main "$@"
